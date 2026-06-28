@@ -1,4 +1,5 @@
 import os
+import time
 import hashlib
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -13,6 +14,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Conservative local safety defaults. HTB does not publish stable public limits for
+# all internal endpoints used by the web app, so the dashboard throttles itself
+# before every live request and relies on Streamlit caching to avoid repeats.
+DEFAULT_MIN_REQUEST_INTERVAL_SEC = float(os.getenv("HTB_MIN_REQUEST_INTERVAL_SEC", "2.5"))
+DEFAULT_MAX_REQUESTS_PER_MINUTE = int(os.getenv("HTB_MAX_REQUESTS_PER_MINUTE", "0"))  # 0 = disabled; spacing-only limiter
+DEFAULT_MAX_REQUESTS_PER_REFRESH = int(os.getenv("HTB_MAX_REQUESTS_PER_REFRESH", "0"))
+DEFAULT_ACTIVITY_PAGES_PER_USER = int(os.getenv("HTB_ACTIVITY_PAGES_PER_USER", "2"))
+DEFAULT_MACHINE_PAGES = int(os.getenv("HTB_MACHINE_PAGES", "3"))
+########/api/v5/machines?per_page=15&showCompleted=incomplete
 DEFAULT_IDS = [2266673, 3769, 4935]
 DEFAULT_BASE = "https://labs.hackthebox.com/api/v4"
 DEFAULT_BASE_V5 = "https://labs.hackthebox.com/api/v5"
@@ -53,6 +63,13 @@ ENDPOINTS = {
     "machine_active": ["machine/active"],
     "machine_paginated": ["machine/paginated"],
     "machine_paginated_pages": ["machine/paginated?page={page}", "machine/paginated?per_page=100&page={page}", "machine/paginated?page={page}&per_page=100"],
+    # Best-effort v5 machine catalogue candidates. These are used only for the
+    # optional free non-seasonal list, and are guarded by the same local rate limiter.
+    "machine_free_nonseasonal_pages": [
+        ("v5", "machines?per_page=50&page={page}&showCompleted=incomplete&free=true"),
+        ("v5", "machines?per_page=50&page={page}&showCompleted=incomplete"),
+        ("v5", "machines?per_page=50&page={page}"),
+    ],
     "machine_todo": ["machine/todo"],
     "rankings_users": ["rankings/users"],
 }
@@ -74,15 +91,62 @@ def auth_headers(token: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
-        "User-Agent": "htb-progress-dashboard/1.5",
+        "User-Agent": "htb-progress-dashboard/1.6-rate-limited",
     }
+
+
+def rate_limit_settings() -> Tuple[float, int, int]:
+    """Return local API pacing settings.
+
+    This build intentionally does not enforce a local request-count stop.
+    The dashboard is paced by sleeping between requests. That means sections
+    load more slowly, but they do not fail with a fake local rate-limit error.
+    """
+    return (
+        float(st.session_state.get("htb_min_request_interval_sec", DEFAULT_MIN_REQUEST_INTERVAL_SEC)),
+        0,
+        0,
+    )
+
+
+def before_live_request(url: str) -> None:
+    """Sleep before live HTB requests; never synthesize local API failures."""
+    min_interval, _max_per_minute, _max_per_refresh = rate_limit_settings()
+    now = time.monotonic()
+    state = st.session_state.setdefault(
+        "htb_rate_state",
+        {"last_request_at": 0.0, "refresh_count": 0},
+    )
+
+    cooldown_until = float(state.get("cooldown_until", 0.0) or 0.0)
+    if cooldown_until and now < cooldown_until:
+        time.sleep(max(0.0, cooldown_until - now))
+        now = time.monotonic()
+        state["cooldown_until"] = 0.0
+
+    elapsed = now - float(state.get("last_request_at", 0.0))
+    wait_for_interval = max(0.0, min_interval - elapsed)
+    if wait_for_interval > 0:
+        time.sleep(wait_for_interval)
+        now = time.monotonic()
+
+    state["last_request_at"] = now
+    state["refresh_count"] = int(state.get("refresh_count", 0)) + 1
+    state["last_url"] = url
+
+def note_rate_limited_response(status_code: int) -> None:
+    if status_code == 429:
+        state = st.session_state.setdefault("htb_rate_state", {})
+        state["cooldown_until"] = time.monotonic() + 300
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_url(base: str, token: str, path: str) -> ApiResult:
     url = f"{clean_base(base)}/{path.lstrip('/')}"
+    before_live_request(url)
     try:
         r = requests.get(url, headers=auth_headers(token), timeout=25)
+        note_rate_limited_response(r.status_code)
         if r.status_code in (401, 403, 404, 429):
             msg = {
                 401: "401 unauthorized: check token",
@@ -150,15 +214,16 @@ def fetch_paginated_endpoint(
     patterns = ENDPOINTS.get(key, [])
 
     for pattern in patterns:
+        endpoint_base, pattern_text = endpoint_base_for(base, pattern)
         rows: List[Dict[str, Any]] = []
         seen = set()
         last_count = 0
         for page in range(1, max_pages + 1):
             try:
-                path = pattern.format(id=user_id, page=page)
+                path = pattern_text.format(id=user_id, page=page)
             except Exception:
-                path = pattern
-            result = fetch_url(base, token, path)
+                path = pattern_text
+            result = fetch_url(endpoint_base, token, path)
             diagnostics.append((path, result.error, result.url, result.status_code))
             if result.data is None:
                 break
@@ -419,7 +484,10 @@ def display_df(
         df = df.drop(columns=sorted(hidden), errors="ignore")
 
     cols = [c for c in preferred_cols if c in df.columns]
-    if cols:
+    show_all = bool(st.session_state.get("show_raw_columns", False))
+    if cols and not show_all:
+        df = df[cols]
+    elif cols:
         df = df[cols + [c for c in df.columns if c not in cols]]
     column_config = {}
     for col in image_cols or []:
@@ -455,6 +523,66 @@ def is_free(row: Dict[str, Any]) -> bool:
     if any(row.get(k) is False or str(row.get(k)).lower() == "false" for k in vip_keys):
         return True
     return False
+
+
+def boolish(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return None
+    s = str(value).strip().lower()
+    if s in {"true", "1", "yes", "y"}:
+        return True
+    if s in {"false", "0", "no", "n"}:
+        return False
+    return None
+
+
+def is_seasonal(row: Dict[str, Any]) -> bool:
+    for key in ["seasonal", "isSeasonal", "is_seasonal", "season_machine", "seasonal_machine"]:
+        value = boolish(row.get(key))
+        if value is not None:
+            return value
+    for key in ["season_id", "seasonId", "season", "season_name", "seasonName"]:
+        value = row.get(key)
+        if value not in (None, "", 0, "0"):
+            return True
+    machine_type = str(row.get("type") or row.get("machine_type") or row.get("state") or "").lower()
+    return "season" in machine_type
+
+
+def is_retired_or_nonseasonal_candidate(row: Dict[str, Any]) -> bool:
+    # These keys vary across HTB payloads. Prefer explicit retired/free flags when present,
+    # otherwise keep the row as a candidate as long as it is free and not seasonal.
+    explicit_active = None
+    for key in ["active", "isActive", "is_active", "currently_active"]:
+        value = boolish(row.get(key))
+        if value is not None:
+            explicit_active = value
+            break
+    if explicit_active is True:
+        return False
+    machine_type = str(row.get("type") or row.get("machine_type") or row.get("state") or row.get("status") or "").lower()
+    if any(word in machine_type for word in ["active", "seasonal"]):
+        return False
+    return True
+
+
+def free_nonseasonal_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for row in rows:
+        if is_completed(row) or not is_free(row) or is_seasonal(row):
+            continue
+        if not is_retired_or_nonseasonal_candidate(row):
+            continue
+        rr = dict(row)
+        rr["owned_user"] = is_user_owned(row)
+        rr["owned_root"] = is_root_owned(row)
+        rr["free_machine"] = True
+        rr["seasonal"] = False
+        rr["estimated_points_available"] = machine_points(row)
+        out.append(rr)
+    return sorted(out, key=lambda x: (as_int(x.get("difficulty")), machine_points(x), str(x.get("name"))), reverse=True)
 
 
 def candidate_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -770,8 +898,8 @@ def generic_submission_events(rows: List[Dict[str, Any]], user: str, user_id: in
     return events
 
 
-
-def fetch_v5_activity_pages(token: str, user_id: int, max_pages: int = 50) -> Tuple[List[Dict[str, Any]], List[Tuple[str, Optional[str], str, Optional[int]]]]:
+##### fix rate limit
+def fetch_v5_activity_pages(token: str, user_id: int, max_pages: int = 1) -> Tuple[List[Dict[str, Any]], List[Tuple[str, Optional[str], str, Optional[int]]]]:
     """Fetch all pages from /api/v5/user/profile/activity/{user}.
 
     Observed payload:
@@ -893,6 +1021,7 @@ def progress_bar(label: str, solved: Any, total: Any, percent: Optional[Any] = N
 
 st.set_page_config(page_title="HTB Progress Dashboard", layout="wide")
 st.title("Hack The Box Progress Dashboard")
+st.caption("Dashboard build: v1.7-no-local-skip — local limiter sleeps only; it never returns a fake per-minute failure.")
 
 with st.sidebar:
     st.header("Configuration")
@@ -901,10 +1030,46 @@ with st.sidebar:
     base = st.text_input("API base", value=os.getenv("HTB_API_BASE", DEFAULT_BASE))
     ids_raw = st.text_area("User IDs", value=",".join(map(str, env_ids())), help="First ID is you; others are friends.")
     graph_range = st.radio("History range", ["1W", "1Y"], index=1, horizontal=True)
+    st.divider()
+    st.subheader("API safety")
+    st.session_state["htb_min_request_interval_sec"] = st.number_input(
+        "Minimum seconds between live API requests",
+        min_value=0.5,
+        max_value=30.0,
+        value=float(st.session_state.get("htb_min_request_interval_sec", DEFAULT_MIN_REQUEST_INTERVAL_SEC)),
+        step=0.5,
+        help="Keep this conservative. Cached responses do not consume live requests.",
+    )
+    st.info("Local request-count limits are disabled in this build. The dashboard only sleeps between live API requests, so tables should not fail locally.")
+    activity_pages_per_user = st.number_input(
+        "Activity pages per user",
+        min_value=1,
+        max_value=50,
+        value=int(os.getenv("HTB_ACTIVITY_PAGES_PER_USER", DEFAULT_ACTIVITY_PAGES_PER_USER)),
+        step=1,
+        help="Lower is safer. Increase only when you intentionally want deeper history.",
+    )
+    machine_pages_to_fetch = st.number_input(
+        "Machine catalogue pages",
+        min_value=1,
+        max_value=20,
+        value=int(os.getenv("HTB_MACHINE_PAGES", DEFAULT_MACHINE_PAGES)),
+        step=1,
+        help="Used for active/free machine lists. Lower is safer.",
+    )
+    show_raw_columns = st.checkbox("Show raw/debug columns in tables", value=False)
     refresh = st.button("Refresh cache")
 
 if refresh:
     st.cache_data.clear()
+    st.session_state["htb_rate_state"] = {"last_request_at": 0.0, "refresh_count": 0}
+
+st.session_state["show_raw_columns"] = bool(show_raw_columns)
+
+# Reset only the per-rerun hard budget. Keep last_request/window/cooldown in
+# session state so reruns are still paced safely.
+_rate_state = st.session_state.setdefault("htb_rate_state", {"last_request_at": 0.0, "refresh_count": 0})
+_rate_state["refresh_count"] = 0
 
 api_token = token_input.strip()
 user_ids = parse_ids(ids_raw)
@@ -914,6 +1079,9 @@ if not api_token:
 if not user_ids:
     st.error("Add at least one HTB user ID.")
     st.stop()
+
+min_interval, max_per_minute, max_per_refresh = rate_limit_settings()
+st.caption(f"API safety: ≥{min_interval:.1f}s between live requests. No local per-minute/request-count failures are generated in this build.")
 
 profiles: Dict[int, Dict[str, Any]] = {}
 challenge_progress_by_user: Dict[int, Dict[str, Any]] = {}
@@ -965,6 +1133,9 @@ for i, uid in enumerate(user_ids):
 summary_df = pd.DataFrame(summary_rows)
 
 st.subheader("Comparison")
+summary_visible_cols = ["avatar", "role", "id", "profile", "name", "rank", "next_rank", "global_ranking", "points", "user_owns", "root_owns", "challenge_owns"]
+if not st.session_state.get("show_raw_columns", False):
+    summary_df = summary_df[[c for c in summary_visible_cols if c in summary_df.columns]]
 st.dataframe(
     summary_df,
     use_container_width=True,
@@ -999,11 +1170,14 @@ active_result = fetch_endpoint(base, api_token, "machine_active")
 active_machine = profile_payload(active_result.data)
 playable_result = fetch_endpoint(base, api_token, "machine_paginated")
 playable_machines = first_list(playable_result.data)
-paginated_machines, machine_page_diagnostics = fetch_paginated_endpoint(base, api_token, "machine_paginated_pages", max_pages=5)
+paginated_machines, machine_page_diagnostics = fetch_paginated_endpoint(base, api_token, "machine_paginated_pages", max_pages=int(machine_pages_to_fetch))
 if len(paginated_machines) > len(playable_machines):
     playable_machines = paginated_machines
 todo_result = fetch_endpoint(base, api_token, "machine_todo")
 todo_machines = first_list(todo_result.data)
+free_catalogue_machines, free_catalogue_diagnostics = fetch_paginated_endpoint(
+    base, api_token, "machine_free_nonseasonal_pages", max_pages=int(machine_pages_to_fetch)
+)
 
 st.subheader("Active and free machines")
 if active_result.error:
@@ -1018,28 +1192,35 @@ else:
 machine_rows = decorate_rows([dict(r, owned_user=is_user_owned(r), owned_root=is_root_owned(r), free_machine=is_free(r)) for r in playable_machines])
 needed_rows = decorate_rows(candidate_rows(playable_machines))
 free_rows = [r for r in machine_rows if r.get("free_machine")]
+nonseasonal_free_rows = decorate_rows(free_nonseasonal_rows(free_catalogue_machines))
 owned_rows = [r for r in machine_rows if r.get("owned_user") or r.get("owned_root")]
 
 if playable_result.error:
     st.warning(f"Active machine list endpoint failed: {playable_result.error} ({playable_result.url})")
-st.caption(f"Fetched {len(playable_machines)} active machine rows. If HTB has 20 active machines, this should now pull beyond the default 15-row page.")
+st.caption(f"Fetched {len(playable_machines)} active machine rows and {len(nonseasonal_free_rows)} free non-seasonal candidate rows under the configured request budget.")
 with st.expander("Active machine pagination diagnostics"):
     if machine_page_diagnostics:
         for path, err, url, status in machine_page_diagnostics:
             st.write(f"`{path}` → status={status}; error={err}; url={url}")
     else:
-        st.write("No pagination candidates were tried.")
+        st.write("No active-machine pagination candidates were tried.")
+    if free_catalogue_diagnostics:
+        st.markdown("**Free/non-seasonal catalogue diagnostics**")
+        for path, err, url, status in free_catalogue_diagnostics:
+            st.write(f"`{path}` → status={status}; error={err}; url={url}")
 
-machine_tabs = st.tabs(["Free active", "All active", "Needed active", "Owned active", "To-do"])
+machine_tabs = st.tabs(["Free active", "Free non-seasonal", "Needed active", "All active", "Owned active", "To-do"])
 with machine_tabs[0]:
-    display_df(free_rows, ["avatar", "id", "name", "os", "difficultyText", "points", "free_machine", "owned_user", "owned_root", "release_readable", "user_owns_count", "root_owns_count"], "No free active machines were returned by the API.", image_cols=["avatar"])
+    display_df(free_rows, ["avatar", "id", "name", "os", "difficultyText", "points", "owned_user", "owned_root", "release_readable"], "No free active machines were returned by the API.", image_cols=["avatar"])
 with machine_tabs[1]:
-    display_df(machine_rows, ["avatar", "id", "name", "os", "difficultyText", "points", "free_machine", "owned_user", "owned_root", "release_readable", "user_owns_count", "root_owns_count"], "No active machines were returned by the API.", image_cols=["avatar"])
+    display_df(nonseasonal_free_rows, ["avatar", "id", "name", "os", "difficultyText", "points", "owned_user", "owned_root", "release_readable", "stars", "rating"], "No free non-seasonal machines were returned by the API under the current page/request limits.", image_cols=["avatar"])
 with machine_tabs[2]:
     display_df(needed_rows, ["avatar", "id", "name", "os", "difficultyText", "points", "estimated_points_available", "free_machine", "owned_user", "owned_root", "release_readable"], "No unsolved active machines were returned.", image_cols=["avatar"])
 with machine_tabs[3]:
-    display_df(owned_rows, ["avatar", "id", "name", "os", "difficultyText", "points", "owned_user", "owned_root", "authUserFirstUserTime_readable", "authUserFirstRootTime_readable"], "No active owned machine rows returned.", image_cols=["avatar"])
+    display_df(machine_rows, ["avatar", "id", "name", "os", "difficultyText", "points", "free_machine", "owned_user", "owned_root", "release_readable"], "No active machines were returned by the API.", image_cols=["avatar"])
 with machine_tabs[4]:
+    display_df(owned_rows, ["avatar", "id", "name", "os", "difficultyText", "points", "owned_user", "owned_root", "authUserFirstUserTime_readable", "authUserFirstRootTime_readable"], "No active owned machine rows returned.", image_cols=["avatar"])
+with machine_tabs[5]:
     display_df(decorate_rows(todo_machines), ["avatar", "id", "name", "os", "difficultyText", "points", "authUserInUserOwns", "authUserInRootOwns", "stars"], "Your HTB machine ToDo list is empty.", image_cols=["avatar"])
 
 st.subheader("Active challenges")
@@ -1099,7 +1280,12 @@ if active_challenge_rows:
 
     st.caption(f"Showing {len(filtered_challenges)} of {len(chall_df)} active challenge rows after filters.")
     challenge_cols = ["avatar", "id", "name", "category_id", "category_display", "difficulty_display", "points", "solved", "likes", "dislikes", "release_date_readable"]
-    challenge_view = filtered_challenges[[c for c in challenge_cols if c in filtered_challenges.columns]].copy()
+    visible_challenge_cols = [c for c in challenge_cols if c in filtered_challenges.columns]
+    challenge_view = (
+        filtered_challenges.copy()
+        if st.session_state.get("show_raw_columns", False)
+        else filtered_challenges[visible_challenge_cols].copy()
+    )
     st.dataframe(
         challenge_view,
         use_container_width=True,
@@ -1120,7 +1306,7 @@ activity_page_diagnostics: List[Tuple[int, str, Optional[str], str, Optional[int
 
 for uid in user_ids:
     name = profiles.get(uid, {}).get("name") or profiles.get(uid, {}).get("username") or str(uid)
-    raw_rows, diagnostics = fetch_v5_activity_pages(api_token, uid, max_pages=50)
+    raw_rows, diagnostics = fetch_v5_activity_pages(api_token, uid, max_pages=int(activity_pages_per_user))
     for path, err, url, status in diagnostics:
         activity_page_diagnostics.append((uid, path, err, url, status))
     if raw_rows:
